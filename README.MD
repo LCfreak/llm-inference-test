@@ -263,37 +263,6 @@ The contribution of this project is not to replace these approaches but to chara
 
 ---
 
-## Open Questions
-
-1. Does token fertility disparity become more or less pronounced under quantization (INT4 vs INT8)?
-2. Does vLLM's PagedAttention implicitly mitigate fertility-related fragmentation, or does it amplify it?
-3. Is the fertility gap primarily a vocabulary coverage problem (solvable by tokenizer retraining) or a memory architecture problem (requiring hardware-level mitigation)?
-4. Does the effect differ between models trained with byte-fallback tokenization vs character-level Devanagari tokens?
-5. At what concurrency level does fertility disparity become the dominant bottleneck vs other inference system components?
-
----
-
-## Contributing
-
-This is an active experimental project. Contributions are welcome in:
-
-- Tokenizer benchmarking and dataset preparation
-- Inference measurement and profiling
-- Apple Silicon / NVIDIA experimental replication
-- vLLM and TGI integration experiments
-- CUDA kernel development
-- Visualization and analysis tooling
-
-To contribute, open an issue describing the experiment or component you want to work on.
-
----
-
-## License
-
-MIT — see LICENSE file.
-
----
-
 *Project by Ashutosh Bhattarai · Pulchowk Campus, Institute of Engineering, Nepal*  
 *Exploring the intersection of tokenizer design and inference systems for global AI deployment*
 
