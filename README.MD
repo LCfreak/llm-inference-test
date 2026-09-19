@@ -162,16 +162,16 @@ Decompose total inference time into prefill (TTFT) and decode (TPOT) components 
 
 ### Planned
 
-**Experiment 8 — KV Cache Eviction Under High Fertility**  
+**Experiment 8 — KV Cache Merging For Low Entropy Tokens**  
 
-Investigate whether high-fertility inputs cause more frequent KV cache eviction under memory pressure, and whether eviction patterns differ across language groups.
+Investigate whether for high fertility inputs, we can merge lower attention tokens to form a new token reducing KV space.
 
 **Experiment 9 — Custom CUDA Kernel for Adaptive KV Fetch**  
 
 Profile KV cache memory access patterns during attention computation for high-fertility vs low-fertility sequences. Investigate whether vectorized memory access (`float4`) and fertility-aware scheduling reduce memory bandwidth consumption for Devanagari inputs on NVIDIA hardware.
 
 **Experiment 10 — Cache Compression Evaluation**  
-Benchmark KV cache compression strategies (quantized KV, token pruning, sliding window attention) specifically for high-fertility language inputs. Determine which compression approach preserves generation quality best for Devanagari scripts.
+Benchmark KV cache compression strategies (quantized KV, token pruning, sliding window attention) specifically for high-fertility language inputs. Determine which compression approach preserves generation quality best for Devanagari scripts on merged tokenization.
 
 **Experiment 11 — Paged Attention Block Size Sensitivity**  
 Test whether larger page sizes in vLLM's PagedAttention reduce fragmentation for high-fertility inputs, potentially recovering concurrency without requiring adaptive allocation at the application layer.
