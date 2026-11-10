@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "Language-Fair LLM Serving: The Systems Cost of Tokenizer Fertility and KV-Cache Compression for Devanagari"
+authors:
+  - family-names: Bhattarai
+    given-names: Ashutosh
+    affiliation: "Pulchowk Campus, Institute of Engineering, Tribhuvan University"
+url: "https://github.com/LCfreak/llm-inference-test"
+type: software

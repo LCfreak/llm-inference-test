@@ -1,273 +1,281 @@
-# Language-Fair LLM Serving: The Systems Cost of Tokenizer Fertility & Word-Aligned KV-Cache Eviction
+# Language-Fair LLM Serving: The Systems Cost of Tokenizer Fertility and KV-Cache Compression for Devanagari
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) ![Domain: Systems for ML](https://img.shields.io/badge/Domain-SysML%20%2F%20LLM%20Serving-purple.svg) ![Status: Active Research](https://img.shields.io/badge/Status-Active%20Research-green.svg)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Type: technical report](https://img.shields.io/badge/type-technical_report-informational.svg)]()
+[![Model: Llama 3.2 1B](https://img.shields.io/badge/model-Llama_3.2_1B-lightgrey.svg)]()
+[![Status: Active Research](https://img.shields.io/badge/status-active_research-green.svg)]()
 
-> **Abstract & Executive Summary**: Multi-tenant Large Language Model (LLM) serving engines (e.g., vLLM, SGLang, `llama.cpp`) allocate Key-Value (KV) cache memory buffers based on token counts. However, Byte-Pair Encoding (BPE) tokenizers exhibit severe **Tokenizer Fertility Inequality**: non-Latin, morphologically rich languages (e.g., Nepali / Devanagari) require **$2.6\times$ to $4.0\times$ more tokens** to express the exact same semantic payload as English. Consequently, non-English streams exhaust GPU PagedAttention dynamic block allocations $2.6\times$ to $4.0\times$ faster, triggering early GPU Out-Of-Memory (OOM) preemptions, degraded request concurrency, and inflated latency.
+**Ashutosh Bhattarai** (Pulchowk Campus, IOE, Tribhuvan University) · bhattaraiaasu1@gmail.com
 
-> This repository presents a systems and algorithmic analysis of language-fair KV cache compression and identifies two key failure modes in current compression literature:
-
-> 1. **Mathematical RoPE Phase Corruption:** Vector state-merging (`merge_entropy`) linearly averages post-Rotary Position Embedding Key vectors, causing destructive phase interference that corrupts query-key spatial attention and reduces long-range factual recall to **$0\%$ exact-match accuracy**.  
-> 2. **Morphological Sub-Word Fracturing:** Standard query-aware eviction (`evict_snapkv`) operates on isolated sub-word tokens, inadvertently evicting mid-word byte fragments in high-fertility scripts and dropping exact-match recall to **$75\%$** under $80\%$ compression.
-
-> To resolve this, we introduce **Word-Aligned SnapKV (`evict_snapkv_word`)**, an atomic, offset-aware eviction policy that aggregates attention scores across sub-word character spans. At **$80\%$ KV cache compression** (achieving complete memory footprint parity with English), Word-Aligned SnapKV restores **$100\%$ exact-match factual recall**, improves NLL ($\Delta \text{NLL} = -0.0458$), and eliminates compounding error drift in 16-step free-running autoregressive generation.
-
----
-
-## 1\. Problem Formulation: Tokenization Inequality
-
-### 1.1 Mathematical Definition of Token Fertility
-
-Modern LLM serving systems allocate Key-Value cache memory proportional to input token sequence length $L$. For a sequence of text containing semantic payload $\mathcal{S}$ (measured in sentence or proposition units), we define **Token Fertility ($\mathcal{F}$)** as:
-
-$$ \mathcal{F} = \frac{\text{Total Generated BPE Tokens}}{\text{Semantic Payload Units } (\mathcal{S})} $$
-
-Evaluating the Llama-3.2-1B tokenizer on the parallel FLORES-200 benchmark:
-
-* **English ($\mathcal{F}_{\text{En}}$):** $\sim 27.4 \text{ tokens/sentence}$
-* **Nepali ($\mathcal{F}_{\text{Ne}}$):** $\sim 68.6 \text{ tokens/sentence}$ ($\mathcal{F}_{\text{Ne}} \approx 2.6\times \text{ to } 4.0\times \mathcal{F}_{\text{En}}$)
-
-```
-[English Payload]  --> "The quick brown fox jumps over the lazy dog."      ~ 10 Tokens  (1.0x KV Memory)
-[Nepali Payload]   --> "चलाख रातो स्याल अल्छी कुकुरमाथि उफ्रन्छ।"        ~ 28 Tokens  (2.8x KV Memory)
-```
-
-### 1.2 Concurrency Collapse in Multi-Tenant Systems
-
-In virtualized memory managers (such as vLLM's PagedAttention or `llama.cpp` static block managers), KV physical blocks are pinned per token slot. High-fertility requests rapidly exhaust the dynamic page pool:
-
-![Serving Capacity Benchmark](research_serving_capacity_benchmark.png) *Figure 1: Hardware memory profiling under multi-tenant serving workloads (`src/profiling`). High-fertility workloads trigger accelerated paging block exhaustion and early concurrency collapse under static memory management, whereas adaptive context sizing bounds latency.*
-
-Standard serving metrics like **Raw Token Throughput (tokens/sec)** mask this systemic inequality because higher token generation rates on non-Latin text represent equal or lower semantic throughput. We define **Effective Semantic Throughput ($\mathbb{T}_{\text{eff}}$)**:
-
-$$ \mathbb{T}_{\text{eff}} = \frac{\text{Raw Token Throughput (tokens/sec)}}{\mathcal{F}} $$
-To equalize $\mathbb{T}_{\text{eff}}$ without truncating context bounds or retraining tokenizers, we investigate dynamic runtime KV cache compression.
+> **Status.** Preliminary results: one model (Llama 3.2 1B), one language pair (English-Nepali), 8-10 documents per
+> language, CPU / Apple Silicon. Every claim is labeled by how strongly the data supports it (Section 6).
+> Feedback and collaboration are welcome (Section 9).
 
 ---
 
-## 2\. Dynamic KV Cache Compression Space
+## At a glance
 
-We design and benchmark three architectural KV cache reduction paradigms inside `kv_compress.py`:
+| | |
+|---|---|
+| **Problem** | Nepali needs ~2.6x the tokens of English, so ~2.6x the KV-cache memory per request |
+| **Question** | Can KV-cache compression recover that cost without hurting quality, and which compression action works? |
+| **Finding 1** | At English-level memory (61% of entries removed), SnapKV-style eviction costs Nepali ~3.5% perplexity; every merging variant tested costs 27-47% |
+| **Finding 2** | Query-aware eviction keeps a planted secret through 60% compression in both languages (8/8); word-aligned eviction is suggestive at 80% (8/8 vs 6/8, not significant) |
+| **Not shown (yet)** | That RoPE causes the merging failure; that word alignment helps generation; any GPU or vLLM result |
+| **Try it** | `python kv_compress.py --selftest` (checks the hand-written forward pass against Hugging Face) |
 
-```
-                                  KV Cache Compression Strategies
-                                                │
-         ┌──────────────────────────────────────┼──────────────────────────────────────┐
-         ▼                                      ▼                                      ▼
-   State Merging                       Standard Eviction                      Word-Aligned Eviction
- (`merge_entropy`)                      (`evict_snapkv`)                     (`evict_snapkv_word`)
- ─────────────────                     ─────────────────                     ───────────────────────
- Averages Key/Value vectors            Retains top-K sub-word                Aggregates attention over 
- based on low attention-               tokens via observation                character spans; keeps/evicts 
- entropy (destructive).                window (sub-word gap).                atomic word units (Ours).
-```
-
-1. **State Merging (`merge_entropy`)**: Identifies tokens with low attention-entropy and linearly merges their Key and Value vectors into centroid representations: $\bar{K}=\frac{1}{M}\sum\limits_{}^{}{K}_{i},\bar{V}=\frac{1}{M}\sum\limits_{}^{}{V}_{i}$.  
-2. **Sub-Word Query-Aware Eviction (`evict_snapkv`)**: Evaluates prompt attention within an observation window $W_{\text{obs}}$, ranks token indices by cumulative attention score, and retains the top\-$K$ sub-word tokens while evicting the remainder.  
-3. **Word-Aligned Query-Aware Eviction (`evict_snapkv_word` \- Proposed)**: Maps sub-word tokens back to raw character offsets in the source string. Aggregates attention scores using max-pooling across constituent sub-word tokens, enforcing atomic retain/evict decisions at whole-word boundaries.
+**Contents:** [Abstract](#abstract) · [Motivation](#1-motivation) · [Setup](#2-setup) · [Results](#3-results) ·
+[Discussion](#4-discussion) · [Threats to validity](#5-threats-to-validity) · [Claims ledger](#6-claims-ledger) ·
+[Roadmap](#7-roadmap) · [Reproducibility](#8-reproducibility) · [Feedback](#9-feedback-wanted) ·
+[Related work](#10-related-work-verify-each-citation-against-the-paper) · [Citation](#citation)
 
 ---
 
-## 3\. Theoretical Analysis: Proof of State-Merging Failure
+## Abstract
 
-### 3.1 RoPE Phase Corruption Proof
+BPE tokenizers trained on English-dominated text split Devanagari words into many byte-level pieces, so the same
+content costs about 2.6x more tokens in Nepali than in English. In an LLM serving system, token count sets KV-cache
+memory per request, prefill compute and concurrency, a cost that per-token benchmarks hide. We ask whether KV-cache
+compression can recover it. Using a leakage-free protocol (prefill, compress the cache, score only the
+continuation), we compare compression methods at equal memory. At the memory footprint of English, SnapKV-style
+eviction keeps Nepali within about 3.5% perplexity (top-1 next-token agreement 0.84), whereas every merging variant
+tested loses 27-47%, and merging hurts Nepali more than English. In a long-range retrieval probe, query-aware
+eviction keeps a planted secret through 60% compression in both languages. A word-aligned variant (keep or evict whole
+words) recalled the secret in 8/8 Nepali documents at 80% compression versus 6/8 for token-level SnapKV, but this is
+not statistically established, and it gives no benefit on KL divergence, top-1 agreement or 16-step generation.
+Several confounds remain open and are listed explicitly.
 
-Modern LLMs utilize Rotary Position Embeddings (RoPE), where position $m$ is embedded by rotating Key vector ${K}_{m}={W}_{K}{x}_{m}$ in $d/2$ two-dimensional planes using rotation matrix ${R}_{\Theta ,m}^{d}$:
-
-$${\tilde{K}}_{m}={R}_{\Theta ,m}^{d}{K}_{m}$$
-
-When merging $M$ contiguous token keys into a centroid key vector $\bar{K}_{\text{merged}}$, the resulting representation is:
-$$ \bar{K}_{\text{merged}} = \frac{1}{M} \sum_{i=1}^{M} R_{\Theta, m_i}^d \cdot (W_K x_{m_i}) $$
-
-Because ${R}_{\Theta ,m}^{d}$ is non-linear with respect to position index $m$, linear vector addition introduces **destructive phase interference**:
-
-$$ \left\| \bar{K}_{\text{merged}} \right\|_2 \ll \frac{1}{M} \sum_{i=1}^{M} \left\| R_{\Theta, m_i}^d (W_K x_{m_i}) \right\|_2 $$
-When a query vector ${Q}_{n}={R}_{\Theta ,n}^{d}({W}_{Q}{x}_{n})$ computes dot-product attention against $\bar{K}_{\text{merged}}$, the relative spatial rotation angles $(n-{m}_{i})$ are mathematically corrupted.
-
-### 3.2 Empirical Proof: Needle-in-a-Haystack Probe
-
-We placed a 4-digit secret key at $10\%$ context depth and evaluated factual retrieval under $60\%$ KV cache reduction:
-
-| Strategy | Compression Class | Nepali Perplexity Shift ($\Delta$ NLL) | Exact Match Retrieval Accuracy |
-| :---- | :---- | :---: | :---: |
-| **`merge_entropy`** | Vector Centroid Merging | $+27.47\%$ | **$0.0\%$** |
-| **`merge_fixed`** | Fixed Block Merging | $+46.84\%$ | **$12.5\%$** |
-| **`evict_snapkv`** | Physical Sub-Word Eviction | **$+3.52\%$** | **$100.0\%$** |
-
-> **Systems Takeaway:** Key vectors encoded with RoPE cannot be linearly merged. Dynamic cache reduction must be achieved via **physical memory eviction**, not vector interpolation.
-
----
-
-## 4\. Proposed Method: Word-Aligned Eviction (`evict_snapkv_word`)
-
-### 4.1 Morphological Fracturing in Sub-Word Eviction
-
-Under high compression ratios ($\ge 80\%$), standard sub-word eviction (`evict_snapkv`) ranks tokens independently. In morphologically rich scripts, BPE splits single words into multi-byte sub-word tokens.
-
-For example, the word **`नेपाल`** splits into sub-words `["ने", "पा", "ल"]`. Standard SnapKV may retain `["ने", "ल"]` while evicting `["पा"]`. The cache now retains a syntactically fractured fragment, dropping exact-match retrieval accuracy from $100\%$ to **$75\%$**.
+## 1. Motivation
 
 ```
-[Standard Sub-Word Eviction]
-Original String:   [  ने  ] [  पा  ] [  ल  ]
-Cache Status:      [ KEEP ] [EVICT ] [ KEEP ]  --> Morphological Fracture (Semantic Noise)
-
-[Word-Aligned Eviction (Ours)]
-Original String:   [  ने  ] [  पा  ] [  ल  ]
-Word Boundary:     └─── Group: "नेपाल" ───┘
-Cache Status:      [ KEEP ] [ KEEP ] [ KEEP ]  --> Atomic Word Preservation
+more tokens per request -> larger KV cache -> fewer concurrent users
+                        -> more prefill compute -> higher time-to-first-token
 ```
 
-### 4.2 Algorithm Implementation
+Standard serving metrics (tokens/s, latency per token) are language-blind. We propose reading throughput per unit
+of content: *effective semantic throughput* = raw token throughput / token expansion ratio, where the token
+expansion ratio is tokens(Nepali) / tokens(English) for paired sentences.
 
-`evict_snapkv_word` enforces atomic word boundary preservation:
+**Questions.**
+1. **RQ1 (cost).** How large is the cost and where does it appear (memory, prefill, concurrency)?
+2. **RQ2 (recovery).** At equal memory (Nepali compressed so its cache matches English uncompressed), how much quality
+   is lost, and does the compression action (evict vs merge) matter?
+3. **RQ3 (selection).** Does attention entropy identify redundant tokens? Does respecting word boundaries help for a
+   script whose words fragment into several tokens?
 
-1. **Token-to-Word Mapping:** Extract character offset bounds $[c_{\text{start}}, c_{\text{end}}]$ for each sub-word token ${t}_{i}$.
-2. **Attention Max-Pooling:** Aggregate attention scores across sub-word tokens belonging to the same word $W_j = \{t_{j,1}, \dots, t_{j,k}\}$: $$ S(W_j) = \max_{t \in W_j} \left( \sum_{h=1}^{H} \sum_{\tau \in W_{\text{obs}}} A_{h, \tau, t} \right) $$  
-3. **Atomic Selection:** Words ${W}_{j}$ are ranked by $S({W}_{j})$, retaining or evicting whole word token groups atomically.
+## 2. Setup
 
-```py
-# Implementation excerpt from kv_compress.py
-def get_word_boundaries(offsets, text):
-    words, current_word = [], []
-    for idx, (start, end) in enumerate(offsets):
-        if start == end: 
-            continue
-        if text[start:end].startswith(" ") or text[start:end].startswith("\n"):
-            if current_word: 
-                words.append(current_word)
-            current_word = [idx]
-        else:
-            current_word.append(idx)
-    if current_word: 
-        words.append(current_word)
-    return words
+| Item | Choice |
+|---|---|
+| Model | Llama 3.2 1B Instruct (fp32, eager attention) |
+| Data | FLORES-200 paired English/Nepali sentences; documents are 10 consecutive sentences |
+| Protocol | Prefill the context uncompressed; compress each layer's KV cache; score only continuation tokens against the compressed cache (no information leakage) |
+| Compression | Same ratio in every layer; the first token (attention sink) is never compressed; merged entries get a log(m) attention-mass bonus |
+| Metrics | Perplexity change; KL divergence and top-1 agreement with the uncompressed model; exact recall of a planted secret; 16-step free-running generation (prefix match) |
+| Verification | The hand-written forward pass matches Hugging Face (max logit difference ~2e-7): `python kv_compress.py --selftest` |
+
+**Which study used which methods.** The perplexity study (Section 3.2, 8 documents) compared eight methods and
+predates word-aligned eviction. The retrieval probe (3.3, 8 documents) and the generation run (3.4, 10 documents)
+add `evict_snapkv_word` and use different document sets, so context lengths differ (about 220 vs 566 tokens in
+the perplexity study, 305 vs 770 in the retrieval probe including the planted fact, 212 vs 545 in the generation run).
+
+| Method | Action | Selection rule |
+|---|---|---|
+| `evict_snapkv` | evict | SnapKV-style: attention from an observation window at the end of the prompt, pooled (first-stage family of RocketKV; no adaptive pooling, no decode-time sparse attention) |
+| `evict_snapkv_word` | evict | Same scores aggregated per word (max over fragments); whole words kept or evicted |
+| `evict_h2o` | evict | Accumulated attention (H2O-style) |
+| `evict_window` | evict | First token + most recent tokens |
+| `merge_entropy` | merge | Runs of lowest attention-entropy tokens (normalized by position) |
+| `merge_random`, `merge_fixed` | merge | Random tokens / equal-size windows (controls) |
+| `merge_sim` | merge | Greedy merging of adjacent most-similar K/V |
+| `merge_word` | merge | Collapse fragments of the same word |
+| `merge_snapkv` | merge | Same scores as `evict_snapkv`, but merge instead of evict (control, not yet run) |
+
+## 3. Results
+
+### 3.1 The cost (RQ1)
+
+Nepali needs about **2.6x** the tokens of English (30 paired FLORES sentences, Llama 3.2 tokenizer: 27.4 vs 68.6
+tokens per sentence; the full-set re-run is pending). KV memory per request scales with this ratio.
+
+![Serving capacity benchmark](research_serving_capacity_benchmark.png)
+*Fig. 1. llama.cpp serving-capacity profiling (CPU / Apple Silicon): with adaptive context sizing under a 2 GB KV
+budget, roughly 415 English, 258 Hindi and 250 Nepali concurrent users fit. The gain over static allocation comes
+from right-sizing the context, not from anything language-specific; the English-Nepali gap follows from the token
+ratio.*
+
+### 3.2 Equal-memory perplexity (RQ2, RQ3; 8 documents)
+
+Matching English memory means removing **61%** of Nepali's KV entries. Nepali results at that point:
+
+| Method | Perplexity change | Top-1 agreement |
+|---|---|---|
+| `evict_snapkv` | +3.5% | 0.84 |
+| `evict_window` | +5.2% | 0.82 |
+| `evict_h2o` | +16.9% | 0.73 |
+| `merge_entropy` | +27.5% | 0.72 |
+| `merge_random` | +28.3% | 0.71 |
+| `merge_word` | +30.9% | 0.71 |
+| `merge_sim` | +32.4% | 0.73 |
+| `merge_fixed` | +46.8% | 0.66 |
+
+![Perplexity vs KV entries removed](compress_curves.png)
+*Fig. 2. Perplexity change vs fraction of KV entries removed. The dashed line marks the 61% equal-memory point.*
+
+- Eviction beats every merging variant by a wide margin. `evict_snapkv` and `evict_window` are **not** distinguishable
+  at this sample size (paired p = 0.38; SnapKV better on 6/8 documents); one document shows +15% under SnapKV.
+- Merging hurts Nepali **more** than English at equal compression (p = 0.008 for fixed, random, similarity and word
+  merging), the opposite of the hypothesis that fragment tokens are redundant.
+- Attention entropy is not a redundancy signal: `merge_entropy` is no better than `merge_random` in Nepali and worse
+  than random in English (p <= 0.04).
+
+### 3.3 Long-range retrieval probe (RQ2, RQ3; 8 documents)
+
+A random 4-digit secret ("The secret code is 4721." / a Nepali equivalent) is planted ~10% into the document and the
+question is placed at the end of the context, so the observation window sees it. The uncompressed model recalls the
+secret in 8/8 documents in both languages.
+
+| Exact recall (of 8) | English 30% | 60% | 80% | Nepali 30% | 60% | 80% |
+|---|---|---|---|---|---|---|
+| `evict_snapkv` | 8 | 8 | 4 | 8 | 8 | 6 |
+| `evict_snapkv_word` | 8 | 8 | 5 | 8 | 8 | 8 |
+| `evict_window`, `evict_h2o` | 0 | 0 | 0 | 0 | 0 | 0 |
+| `merge_entropy` | 2 | 0 | 0 | 8 | 2 | 0 |
+| `merge_word` | 0 | 0 | 0 | 8 | 0 | 0 |
+| `merge_random` | 1 | 0 | 0 | 5 | 1 | 0 |
+| `merge_sim` | 1 | 0 | 0 | 2 | 0 | 0 |
+| `merge_fixed` | 0 | 0 | 0 | 1 | 0 | 0 |
+
+Cache entries kept (mean): English 213 / 122 / 61 and Nepali 539 / 308 / 154 at 30% / 60% / 80% removal, out of
+305 and 770 context tokens. Answer-token NLL change in Nepali at 80%: `evict_snapkv` +0.123, `evict_snapkv_word` -0.046.
+
+- Query-aware selection is what preserves the secret: SnapKV-style methods keep it to 60% compression in both
+  languages; query-agnostic eviction loses it.
+- **Reading "100% at 80%" correctly.** It is 8/8 documents (consistent with a true rate anywhere above about 63%).
+  Nepali's longer context leaves more absolute entries at the same ratio (154 vs 61), and English also scores 8/8 when
+  it keeps 122 entries, so this is an absolute-budget effect, not evidence of a Nepali-specific advantage.
+- **The probe is easy.** The question nearly repeats the planted sentence and sits in the observation window. Harder
+  variants (paraphrased question, distractor codes, several depths, longer contexts) are planned.
+- **Not a fair merge-vs-evict comparison:** only the SnapKV methods see the question. The control `merge_snapkv` (same
+  scores, merge instead of evict) is the next run.
+- Word-aligned vs token-level SnapKV at 80%: Nepali 8/8 vs 6/8, English 5/8 vs 4/8. The word-aligned variant never
+  lost (2 wins, 0 losses in Nepali; sign test p = 0.50), so this is suggestive only. At 60% the two are identical.
+- Unexplained: at 30% compression, entropy-guided and word merging keep the secret in 8/8 Nepali documents but not in
+  English, the opposite direction from the perplexity result.
+
+### 3.4 Teacher-forced agreement and 16-step generation (10 documents)
+
+Prefix match is the fraction of 16 greedy tokens before the first divergence from the uncompressed output.
+
+| Method | Nepali prefix match (30 / 60 / 80%) | English prefix match (30 / 60 / 80%) | KL at 60% (Nepali / English) |
+|---|---|---|---|
+| `evict_snapkv_word` | 0.32 / 0.25 / 0.16 | 0.74 / 0.49 / 0.42 | 0.0746 / 0.023 |
+| `evict_snapkv` | 0.30 / 0.24 / 0.16 | 0.79 / 0.47 / 0.43 | 0.0718 / 0.024 |
+| `evict_window` | 0.28 / 0.21 / 0.14 | 0.73 / 0.46 / 0.38 | 0.0831 / 0.039 |
+| `merge_entropy` | 0.15 / 0.09 / 0.05 | 0.28 / 0.08 / 0.04 | 0.2121 / 0.174 |
+
+- Word-aligned and token-level SnapKV are indistinguishable on prefix match, KL and top-1 agreement across both
+  languages and all ratios; where a difference is nominally significant (KL, Nepali 80%, p = 0.05), word alignment is
+  slightly *worse*. This does **not** support a generation-stability advantage for word alignment.
+- Nepali output diverges from the uncompressed output earlier than English at the same ratio, and even at 30%
+  removal Nepali prefix match is only about 0.30. Because near-tied predictions in uncertain text can flip from tiny
+  numerical noise, the prefix-match metric's noise floor must be measured before it is used to compare methods.
+- `merge_entropy` is clearly worse than all eviction methods in both languages.
+
+## 4. Discussion
+
+1. **A language-dependent cost is real and large, and eviction recovers most of it at modest perplexity cost** in this
+   setup. Perplexity is a proxy; top-1 agreement of 0.84 means about 1 in 6 predictions changes.
+2. **Merging averaged key/value vectors did poorly here**, and more so for Nepali. A candidate explanation is that
+   averaging post-RoPE keys mixes position-dependent rotations, but that mechanism is untested; the planned controls
+   (`merge_snapkv`, merging only older context, pre-RoPE merging) separate the action from the selection rule.
+3. **The Devanagari-specific idea** (do not split words when evicting) has a plausible rationale and a suggestive
+   retrieval signal, but no benefit on the other metrics. It needs more documents, harder probes, a second language
+   and a second tokenizer before it can be called an effect.
+
+## 5. Threats to validity
+
+- 8-10 documents per language; many paired tests with no multiplicity correction; treat p-values as indicative.
+- One 1B model, short contexts (~200-800 tokens), which favors recency; one language pair; CPU only.
+- The equal-memory perplexity study did not include word-aligned eviction.
+- The merging methods also collapsed recent tokens, which the eviction baselines protect (control pending).
+- The retrieval probe uses one fact type, one planting position, and a near-verbatim question; query-aware methods see
+  the question. Query-aware compression needs the question at compression time, which fails for multi-turn use.
+- Perplexity, top-1 agreement and prefix match are proxies; no downstream task has been run.
+- The SnapKV baseline is first-stage-style only; selection is shared across heads within a layer.
+
+## 6. Claims ledger
+
+| Claim | Evidence | Status |
+|---|---|---|
+| Nepali needs ~2.6x the tokens of English | 30 FLORES pairs; document sets of 10 sentences | Measured (full-set re-run pending) |
+| SnapKV-style eviction brings Nepali to English-level memory for ~+3.5% perplexity | n = 8, one document at +15% | Measured, small sample |
+| All merging variants lose 27-47% at 61% | n = 8 | Measured |
+| Merging hurts Nepali more than English | p = 0.008, n = 8 | Measured, small sample |
+| Entropy does not identify redundant tokens | worse than random in English (p <= 0.04) | Measured, small sample |
+| Query-aware eviction keeps a planted secret to 60% compression | 8/8 in both languages | Measured; easy probe, confounded by query access |
+| Word-aligned eviction beats token-level SnapKV at 80% retrieval | 8/8 vs 6/8 (Nepali), p = 0.50 | Suggestive |
+| Word alignment improves KL, agreement or generation | no difference; KL nominally worse | Not supported |
+| RoPE phase interference explains the merging failure | none yet | Hypothesis |
+| Behavior in vLLM / PagedAttention, on GPUs, in other models or languages | none | Not tested |
+
+## 7. Roadmap
+
+| # | Experiment | Command |
+|---|---|---|
+| 1 | Merge vs evict with identical SnapKV scores | `python kv_compress.py --needle --methods evict_snapkv merge_snapkv evict_snapkv_word merge_random --ratios 0.3 0.6 0.8 --docs 30 --out needle_control.csv` |
+| 2 | Equal-memory perplexity including word-aligned eviction, 30 documents | `python kv_compress.py --methods evict_snapkv merge_snapkv evict_snapkv_word evict_window --ratios 0.3 0.6 0.8 --docs 30 --out compress_control.csv` |
+| 3 | Merge only older context (protect last 32 tokens) | `python kv_compress.py --protect-last 32 --docs 12 --ratios 0.3 0.6 --out compress_pl32.csv` |
+| 4 | Harder retrieval probe: paraphrased question, distractors, several depths, longer contexts | planned |
+| 5 | Noise floor for prefix match (perturb K/V slightly, rerun) | planned |
+| 6 | Second language (Hindi), second model, downstream task | planned |
+| 7 | NVIDIA GPU replication, profiling, vLLM comparison | planned |
+| 8 | Custom kernel (Triton / CUDA) for segment-aware top-k | conditional: only if profiling shows the selection step matters |
+
+## 8. Reproducibility
+
+```bash
+pip install torch transformers pandas scipy matplotlib tqdm
+python kv_compress.py --selftest                                   # forward pass vs Hugging Face
+python kv_compress.py --docs 8 --ratios 0.3 0.6 0.8 --out compress_results.csv
+python kv_compress.py --needle --needle-pos 0.1 --docs 8 --ratios 0.3 0.6 0.8 --out needle_results.csv
+python kv_compress.py --docs 10 --ratios 0.3 0.6 0.8 --methods evict_snapkv_word evict_snapkv evict_window merge_entropy \
+    --gen-steps 16 --out gen_results_16.csv
+python analyze_compress.py compress_results.csv                    # tables + compress_curves.png
+python analyze_needle.py needle_results.csv
 ```
 
----
-
-## 5\. Experimental Results
-
-### 5.1 Perplexity vs. KV Cache Reduction
-
-Evaluated on Llama-3.2-1B-Instruct across parallel English and Nepali FLORES-200 corpora (`compress_results.csv`, processed via `analyze_compress.py`).
-
-![Perplexity Curves vs. KV Entries Removed](compress_curves.png) *Figure 2: Perplexity change relative to uncompressed baseline across compression ratios. The vertical dashed line at **$61\%$ compression** represents the **Memory Parity Point**, where Nepali's compressed KV memory footprint matches the uncompressed memory footprint of English.*
-
-Key Findings:
-
-* At **$61\%$ compression**, Nepali matches English memory consumption while maintaining baseline log-likelihood ($\Delta \text{NLL} \le +0.02$).  
-* Word-aligned eviction consistently outperforms standard SnapKV in negative log-likelihood stability across compression thresholds.
-
-### 5.2 Long-Range Factual Retrieval Probe (Needle-in-a-Haystack)
-
-Retrieval of a 4-digit key placed at $10\%$ context depth under extreme $80\%$ compression (`analyze_needle.py`):
-
-| Method (@ 80% Compression) | English Exact Match | Nepali Exact Match | Nepali Delta NLL | Memory Parity Achieved |
-| :---- | :---: | :---: | :---: | :---: |
-| **Uncompressed Baseline** | $100.0\%$ | $100.0\%$ | $0.0000$ | No |
-| **Standard SnapKV (`evict_snapkv`)** | $50.0\%$ | $75.0\%$ | $+0.1229$ | Yes |
-| **Word-Aligned SnapKV (`evict_snapkv_word`)** | **$62.5\%$** | **$100.0\%$** | **$-0.0458$** | **Yes** |
-
-### 5.3 Multi-Step Autoregressive Decoding Audit
-
-To evaluate long-context stability during output generation, we conducted **16-step free-running autoregressive decoding** (`--gen-steps 16`, output dataset `gen_results_16_2.csv`), continuously querying the compressed KV cache:
-
-| Policy (Nepali @ 60% Compression) | 16-Step Prefix Match | KL Divergence (nats/tok) | Failure Mode Analysis |
-| :---- | :---: | :---: | :---- |
-| **Word-Aligned SnapKV (`evict_snapkv_word`)** | **$25.00\%$** | **$0.0746$** | **Stable:** Intact word boundaries prevent drift. |
-| **Standard SnapKV (`evict_snapkv`)** | $23.75\%$ | $0.0718$ | **Minor Drift:** Sub-word fragmentation introduces noise. |
-| **Window Eviction (`evict_window`)** | $20.63\%$ | $0.0831$ | **Moderate Drift:** Loss of initial prompt context. |
-| **State Merging (`merge_entropy`)** | $9.38\%$ | $0.2121$ | **Severe Breakdown:** RoPE corruption causes hallucinations. |
-
----
-
-## 6\. Repository Structure & Reproducibility
-
-```
+```text
 llm-inference-test/
-├── kv_compress.py            # Main engine: prefill, leakage-free scoring, needle probe, 16-step decoding
-├── analyze_compress.py       # Statistical evaluation: paired t-tests & memory parity interpolation
-├── analyze_needle.py         # Long-range retrieval needle evaluation scripts
-├── compress_curves.png       # Perplexity vs. KV Cache Reduction plot
-├── research_serving_capacity_benchmark.png # Baseline GPU/CPU memory profiling plot
-├── compress_results.csv      # Benchmarking dataset across languages & compression ratios
-├── gen_results_16_2.csv      # 16-step autoregressive generation audit dataset
-└── llama_cpp/                # Phase 1 hardware memory profiling scripts
+├── kv_compress.py            # prefill, leakage-free scoring, compression methods, needle probe, generation
+├── analyze_compress.py       # paired tests, equal-memory interpolation, figure
+├── analyze_needle.py         # retrieval-probe analysis
+├── compress_results.csv, needle_results.csv, gen_results_16.csv
+├── compress_curves.png, research_serving_capacity_benchmark.png
+└── llama_cpp/                # serving-capacity profiling scripts
 ```
 
-### Reproducibility Commands
+## 9. Feedback wanted
 
-**1\. Primary Benchmarking (Perplexity & Top-1 Agreement):**
+- Is there an existing result on merge-vs-evict at fixed selection scores for non-Latin scripts?
+- Is word-level (or morpheme-level) eviction worth pursuing in engines such as vLLM or llama.cpp, or does a
+  tokenizer-level fix make it moot?
+- Which benchmark would convince you that a compressed cache is "equivalent" for a low-resource language?
 
-```sh
-python kv_compress.py \
-  --model meta-llama/Llama-3.2-1B-Instruct \
-  --docs 10 \
-  --ratios 0.3 0.6 0.8 \
-  --methods evict_snapkv_word evict_snapkv evict_window merge_entropy \
-  --out compress_results.csv
-```
+## 10. Related work (verify each citation against the paper)
 
-**2\. Long-Range Factual Recall Probe (Needle-in-a-Haystack):**
+Kwon et al. 2023, *PagedAttention* (vLLM) · Xiao et al. 2023, *StreamingLLM* · Zhang et al. 2023, *H2O* ·
+Li et al. 2024, *SnapKV* · Liu et al. 2023, *Scissorhands* · Liu et al. 2024, *KIVI* ·
+Behnam et al., ICML 2025, *RocketKV* · Agrawal et al., OSDI 2024, *Sarathi-Serve* ·
+Petrov et al. 2023, *Language Model Tokenizers Introduce Unfairness Between Languages*
 
-```sh
-python kv_compress.py \
-  --model meta-llama/Llama-3.2-1B-Instruct \
-  --needle \
-  --needle-pos 0.1 \
-  --docs 10 \
-  --ratios 0.3 0.6 0.8 \
-  --out needle_results.csv
-```
-
-**3\. Multi-Step Autoregressive Generation Audit:**
-
-```sh
-python kv_compress.py \
-  --model meta-llama/Llama-3.2-1B-Instruct \
-  --docs 10 \
-  --ratios 0.3 0.6 0.8 \
-  --methods evict_snapkv_word evict_snapkv evict_window merge_entropy \
-  --gen-steps 16 \
-  --out gen_results_16.csv
-```
-
-**4\. Run Statistical Analysis & Visualization:**
-
-```sh
-python analyze_compress.py --input compress_results.csv
-python analyze_needle.py --input needle_results.csv
-```
-
----
-
-## 7\. Systems Research Roadmap
-
-- [x] **Phase 1: Tokenization Inequality Quantification:** Profiling BPE fertility gaps across languages (`llama.cpp` context profiling).  
-- [x] **Phase 2: RoPE Phase Corruption Proof:** Theoretical derivation and empirical validation of RoPE phase interference in state merging.  
-- [x] **Phase 3: Word-Aligned Eviction Design:** Engineering `evict_snapkv_word` using character offset maps and attention max-pooling.  
-- [x] **Phase 4: Autoregressive Stability Audit:** Measuring multi-step generation drift and KL-divergence bounds.  
-- [ ] **Phase 5: Triton Segment-Aware Top-K Kernel (In Progress):** Writing a Triton kernel to perform offset-aware word pooling directly on GPU memory during prefill.  
-- [ ] **Phase 6: vLLM Block Manager Integration (Planned):** Implementing word-aligned eviction as a custom dynamic block manager within vLLM's PagedAttention.
-
----
-
-## 📜 Citation & Contact
-
-If you use this repository, findings, or code in your research on SysML, LLM serving infrastructure, or KV cache compression, please cite:
+## Citation
 
 ```bibtex
 @misc{bhattarai2026languagefair,
-  author       = {Bhattarai, Ashutosh},
-  title        = {Language-Fair LLM Serving: The Systems Cost of Tokenizer Fertility \& Word-Aligned KV-Cache Eviction},
-  year         = {2026},
-  publisher    = {GitHub},
-  journal      = {GitHub Repository},
+  author = {Bhattarai, Ashutosh},
+  title  = {Language-Fair LLM Serving: The Systems Cost of Tokenizer Fertility and KV-Cache Compression for Devanagari},
+  year   = {2026},
   howpublished = {\url{https://github.com/LCfreak/llm-inference-test}}
 }
 ```
-
-&nbsp;
-
-* **Author:** Ashutosh Bhattarai (Institute of Engineering, Tribhuvan University)  
-* **Research Focus:** Systems for Machine Learning (SysML), LLM Serving Infrastructure, Memory Management, KV Cache Optimization  
-* **Contact:** [bhattaraiaasu1@gmail.com](mailto:ashutosh.bhattarai.research@gmail.com) *(Seeking PhD opportunities for Fall 2027\)*
