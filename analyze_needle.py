@@ -1,11 +1,4 @@
-"""
-analyze_needle.py  -  summarise needle_results.csv from `kv_compress.py --needle`.
 
-  python analyze_needle.py needle_results.csv
-
-Reports how often the compressed cache still lets the model recall a planted 4-digit secret.
-If the UNcompressed model can't do it either (exact_base low), the probe is uninformative.
-"""
 import sys
 import warnings
 
