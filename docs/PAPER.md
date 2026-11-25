@@ -92,6 +92,7 @@ Word budget: 180–220.
 | Fig. 3 | `out/figures/fig3_equal_memory.png` | perplexity increase **at equal memory** vs log expansion; regression line |
 | Fig. 4 | `out/figures/fig4_operator.png` | `evict_snapkv` vs `merge_snapkv` per language, same scores |
 | Fig. 5 | `out/figures/fig5_recall.png` | exact recall heatmap, policy × (language, ratio) |
+| Fig. 6 | `out/figures/fig6_fixed_budget.png` | ΔPPL at a **fixed token budget** $C$, with the fraction of each cache actually removed printed under every language; English at 0% is the point |
 | Tab. 1 | `out/tables/expansion.csv` | model, tokenizer, tokens/sentence, expansion, $r_\ell$ |
 | Tab. 2 | `out/tables/equal_memory.csv` | ΔPPL % with 95% bootstrap CI, top-1 agreement, n |
 | Tab. 3 | `out/tables/needle_recall.csv` | exact recall, n, and the absolute retained-entry count (not just ratio) |
@@ -114,6 +115,8 @@ interpolated rather than measured, say so in the caption.
 | C6 | Word-aligned eviction helps at high compression | `needle_recall.csv` | **Pending E4**, $n=8$ in old data, $p=0.50$ |
 | C7 | Post-RoPE phase interference causes merging failure | C5 + pre/post-RoPE ablation | **Hypothesis** unless C5 is large and the ablation runs |
 | C8 | Compression yields real VRAM/latency gains under PagedAttention | E7 | **Pending** |
+| C9 | At a fixed 1024-token budget, English is not compressed at all while Tamil loses ~half its cache | `fixed_budget.csv`, E9 | **Pending E2** (arithmetic already exact: $1 - C/P$) |
+| C10 | Attention-free selection (`evict_vk`, `evict_keynorm`) changes the cross-language ranking relative to query-aware selection | `equal_memory.csv` rows for the two new baselines | **Pending E2** |
 
 Rules:
 
@@ -132,7 +135,11 @@ Agrawal et al., *Sarathi-Serve*, OSDI 2024.
 **KV eviction and compression.** Xiao et al., *StreamingLLM*, ICLR 2024. Zhang et
 al., *H2O*, NeurIPS 2023. Li et al., *SnapKV*, NeurIPS 2024. Liu et al.,
 *Scissorhands*, NeurIPS 2023. Liu et al., *KIVI*, ICML 2024. Behnam et al.,
-*RocketKV*, ICML 2025.
+*RocketKV*, ICML 2025. Chitty-Venkata et al., *PagedEviction*, arXiv:2509.04377,
+2025 — the block-aligned, attention-free line whose fixed 256–4096-token budget
+is the object of our §4.1 critique, and whose $\|V\|_2/\|K\|_2$ score we adopt as a
+baseline. Devoto et al., *A Simple and Effective L2 Norm-Based Strategy*, 2024 —
+inverse key norm, our second attention-free baseline.
 
 **Tokenizer fairness and multilingual cost.** Petrov et al., *Language Model
 Tokenizers Introduce Unfairness Between Languages*, NeurIPS 2023. Ahia et al.,

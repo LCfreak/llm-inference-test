@@ -101,7 +101,7 @@ python src/kv_compress.py \
   --model meta-llama/Llama-3.2-1B-Instruct \
   --langs english nepali hindi bengali tamil amharic \
   --docs 60 --sents 10 --max-tokens 4096 \
-  --ratios 0.3 0.6 0.8 --equal-memory \
+  --ratios 0.3 0.6 0.8 --equal-memory --fixed-budget 1024 \
   --out out/compress_llama1b.csv
 ```
 
@@ -112,6 +112,7 @@ What the flags do:
 | `--equal-memory` | adds each language's exact $r_\ell = 1 - P_{en}/P_\ell$ to the sweep, so no interpolation is needed for the headline number |
 | `--doc-start` | first document index; used for sharding across sessions |
 | `--append` | merge into an existing CSV and de-duplicate, so a killed run resumes |
+| `--fixed-budget 1024` | adds the ratio $1 - C/P$ that a fixed token budget forces, so the paper can report what a published fixed-budget benchmark actually measures per language |
 | `--max-tokens 4096` | safety cap only. It must exceed the longest Tamil/Amharic document; a binding cap truncates only the high-fertility languages and biases $r_\ell$ downwards. Every row records `truncated` and `n_tokens_full`. |
 | `--protect-last 32` | recency control (PLAN E6) |
 | `--dtype float16` | only for Qwen-3B on T4; keep Llama-1B in FP32 |
@@ -207,6 +208,7 @@ Produces:
 | `out/tables/regression.csv` | ΔPPL % vs log(expansion) slope, $R^2$, p |
 | `out/tables/paired_evict_vs_merge.csv` | Wilcoxon + Holm for the operator test |
 | `out/tables/needle_recall.csv` | exact recall per language/policy/ratio |
+| `out/tables/fixed_budget.csv` | ΔPPL at a fixed token budget, with the fraction of cache actually removed per language |
 | `out/tables/gen_prefix.csv` | fraction of the uncompressed greedy prefix reproduced |
 | `out/tables/serve.csv` | max batch without OOM, throughput, TTFT/TPOT, VRAM, preemptions |
 | `out/figures/fig1…fig5` | PNG + PDF, 300 dpi |

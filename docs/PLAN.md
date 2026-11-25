@@ -41,6 +41,11 @@ Three contributions, in order of importance:
    as `evict_snapkv` but merges instead of evicting. That separates *what to
    select* from *what to do with it* — the causal test for the post-RoPE merging
    hypothesis.
+4. **The fixed-budget audit.** Published KV-compression work evaluates at a fixed
+   token budget $C$ (256–4096). At $C=1024$ an English document of ~290 tokens is
+   not compressed at all, while a Tamil document of ~2,100 loses half its cache.
+   We report that arithmetic per language, so the benchmark's English number is
+   no longer mistaken for a fair comparison.
 
 ---
 
@@ -95,7 +100,11 @@ the post-RoPE hypothesis cannot be asserted without evidence.
 - `Qwen/Qwen2.5-3B-Instruct`, FP16 — second tokenizer, same code path.
 - Optional if Blackwell arrives: `Qwen/Qwen2.5-32B-Instruct` or `Llama-3.1-8B`, serving only.
 
-**Policies:** the 10 already implemented. No new policies.
+**Policies:** the 10 already implemented, plus two attention-free baselines —
+`evict_vk` (PagedEviction's $\|V\|_2/\|K\|_2$ score, arXiv:2509.04377) and
+`evict_keynorm` (inverse key L2 norm, Devoto et al. 2024). These are the
+comparison class that the systems literature actually uses; without them the
+paper talks past that literature. No other new policies.
 
 **Hardware:** 1×T4 16 GB (Kaggle) for quality; same for serving. Report the
 hardware tier honestly. No A100 claims.
@@ -111,12 +120,13 @@ tensor-parallel scaling.
 | # | Experiment | Command | Answers | Cost (T4) |
 |---|---|---|---|---|
 | E1 | Fertility table, 6 langs, 2 tokenizers | `make_data.py --tokenizer ...` | RQ1: how big is the penalty, per tokenizer | minutes |
-| E2 | Quality sweep, Llama-1B FP32, 60 docs | `kv_compress.py --docs 60 --equal-memory` | RQ2/RQ3: quality at equal memory | ~3 h |
+| E2 | Quality sweep, Llama-1B FP32, 60 docs | `kv_compress.py --docs 60 --equal-memory --fixed-budget 1024` | RQ2/RQ3: quality at equal memory | ~3.5 h |
 | E3 | Quality sweep, Qwen-3B FP16, 60 docs | same, `--model Qwen/... --dtype float16` | RQ5: does it replicate across tokenizers | ~1.5 h |
 | E4 | Needle probe, 40 docs | `--needle --docs 40` | RQ2: long-range recall under compression | ~1.5 h |
 | E5 | Generation, 20 docs, 16 steps | `--gen-steps 16` | RQ4: trajectory stability | ~2 h |
 | E6 | Recency control | `--protect-last 32` | Confound: is merging failing only because it eats recent tokens | ~45 min |
 | E7 | Serving sweep, vLLM, 6 langs | `serve_bench.py --mode offline` | RQ1: measured capacity, TTFT/TPOT, preemptions | ~1 h |
+| E9 | Fixed-budget control: score every language at $C=1024$ tokens, the setting used by block-wise eviction work | `--fixed-budget 1024` | RQ1: how much of a published benchmark's English score is a free pass | included in E2/E3 |
 | E8 | Bootstrap + regression + figures | `analyze.py` | All | minutes |
 
 Total ≈ 9–10 T4-hours. One Kaggle account (30 h/week) still covers it, but E2 no

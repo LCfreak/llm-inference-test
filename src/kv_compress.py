@@ -71,7 +71,10 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 METHODS = ["merge_entropy", "merge_random", "merge_fixed", "merge_sim", "merge_word", "merge_snapkv",
-           "evict_h2o", "evict_snapkv", "evict_snapkv_word", "evict_window"]
+           "evict_h2o", "evict_snapkv", "evict_snapkv_word", "evict_window",
+           # attention-free, static-KV baselines: the class used by PagedEviction
+           # (arXiv:2509.04377) and by inverse-key-L2-norm (Devoto et al. 2024).
+           "evict_vk", "evict_keynorm"]
 
 # Languages in the expanded study. Column names in the parallel CSV must match these.
 LANGS = ["english", "nepali", "hindi", "bengali", "tamil", "amharic"]
@@ -441,6 +444,32 @@ def groups_evict(P, keep_positions):
     return [(int(i), int(i) + 1) for i in sorted(keep_positions)]
 
 
+def _keep_top(P, score, R, protect_first):
+    """Keep the protect_first tokens plus the highest-scoring candidates, to hit P - R."""
+    keep_n = P - R
+    cand = np.arange(protect_first, P)
+    top = cand[np.argsort(-score[cand], kind="stable")[: max(0, keep_n - protect_first)]]
+    return groups_evict(P, list(range(protect_first)) + list(top))
+
+
+def groups_vk(P, st, R, protect_first):
+    """PagedEviction's score (arXiv:2509.04377, Alg. 1): importance = ||V_i||_2 / ||K_i||_2,
+    computed from the static KV cache alone, no attention matrix. Included here as the
+    attention-free baseline, so the cross-language ranking can be compared against a
+    query-aware selector on identical documents."""
+    K = st["K"][0].float()
+    V = st["V"][0].float()
+    score = (V.norm(dim=-1) / (K.norm(dim=-1) + 1e-6)).mean(0)
+    return _keep_top(P, score.cpu().numpy(), R, protect_first)
+
+
+def groups_keynorm(P, st, R, protect_first):
+    """Inverse Key L2-Norm (Devoto et al. 2024): keep the LOWEST-norm keys, which are the
+    ones that attract disproportionate attention. Also used as a baseline in PagedEviction."""
+    score = -st["K"][0].float().norm(dim=-1).mean(0)
+    return _keep_top(P, score.cpu().numpy(), R, protect_first)
+
+
 def build_groups(method, st, R, protect_first, rng):
     P = st["K"].shape[2]
     if R <= 0:
@@ -470,6 +499,10 @@ def build_groups(method, st, R, protect_first, rng):
     if method == "evict_window":
         recent = cand[-(keep_n - protect_first):]
         return groups_evict(P, list(range(protect_first)) + list(recent))
+    if method == "evict_vk":
+        return groups_vk(P, st, R, protect_first)
+    if method == "evict_keynorm":
+        return groups_keynorm(P, st, R, protect_first)
     raise ValueError(method)
 
 
@@ -617,11 +650,18 @@ def _flush(rows, args, key):
     df.to_csv(args.out, index=False)
 
 
-def _ratios_for(args, lang, equal_mem):
-    """Grid ratios plus, optionally, the exact equal-memory ratio 1 - ref/P."""
+def _ratios_for(args, lang, equal_mem, P):
+    """Grid ratios, plus the exact equal-memory ratio 1 - ref/P, plus the fixed-token-budget
+    ratio 1 - C/P used by block-wise eviction work (PagedEviction budgets 256-4096 tokens).
+    At C=1024 an English document of ~290 tokens gets E = L - C < 0, i.e. no compression at
+    all, while a Tamil document loses half its cache. That contrast is the point of the row."""
     ratios = [(float(r), "grid") for r in args.ratios]
     if args.equal_memory and lang != "english" and 0.0 < equal_mem < 0.95:
         ratios.append((float(equal_mem), "equal_mem"))
+    if getattr(args, "fixed_budget", 0) and P > args.fixed_budget > 0:
+        r = 1.0 - args.fixed_budget / float(P)
+        if 0.001 < r < 0.95:
+            ratios.append((round(r, 4), "fixed_budget"))
     return ratios
 
 
@@ -667,7 +707,7 @@ def run_needle(args, model, tokenizer, device, layers_set, n_layers, tag):
             nll0, acc0, ex0 = score(base)
             em = 1.0 - ref / P
             for method in args.methods:
-                for ratio, kind in _ratios_for(args, lang, em):
+                for ratio, kind in _ratios_for(args, lang, em, P):
                     ratio = round(ratio, 4)
                     comp, kept = compress_context(stats, method, ratio, layers_set, args.protect_first,
                                                   not args.no_bias, d, args.protect_last)
@@ -757,7 +797,7 @@ def run(args):
             em = 1.0 - ref / ctx_len
 
             for method in args.methods:
-                for ratio, kind in _ratios_for(args, lang, em):
+                for ratio, kind in _ratios_for(args, lang, em, ctx_len):
                     ratio = round(ratio, 4)
                     comp, kept = compress_context(stats, method, ratio, layers_set,
                                                   args.protect_first, not args.no_bias, d, args.protect_last)
@@ -801,6 +841,10 @@ if __name__ == "__main__":
     ap.add_argument("--ratios", type=float, nargs="+", default=[0.3, 0.6, 0.8])
     ap.add_argument("--equal-memory", action="store_true",
                     help="also evaluate each language at its exact equal-memory ratio 1 - ref/P")
+    ap.add_argument("--fixed-budget", type=int, default=0,
+                    help="also evaluate at the fixed token budget C used by block-wise eviction "
+                         "work (e.g. 1024), i.e. ratio 1 - C/P; English usually needs no "
+                         "compression at all at C=1024, which is the point")
     ap.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
     ap.add_argument("--layers", default="all", help="'all' or a range like 4-11")
     ap.add_argument("--protect-first", type=int, default=1, help="never merge/evict the first N tokens (BOS sink)")

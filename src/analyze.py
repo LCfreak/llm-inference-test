@@ -214,6 +214,58 @@ def paired_tests(em, a, b):
     return out
 
 
+def fixed_budget_table(df, budget):
+    """Quality at a FIXED token budget C, the setting used by block-wise eviction work.
+
+    For a document whose language-l context is P tokens, the budget forces the ratio
+    1 - C/P. When C >= P (English at C=1024) nothing is removed at all, so the
+    uncompressed score is the correct entry: that language is being handed a free
+    pass by the benchmark, and this table shows how large the pass is.
+    """
+    if "ctx_len" not in df.columns:
+        return pd.DataFrame()
+    out = []
+    keys = ["model", "lang", "doc", "method"]
+    ctx = df.dropna(subset=["ctx_len"]).drop_duplicates(subset=["model", "lang", "doc"])
+    ctx = ctx.set_index(["model", "lang", "doc"])["ctx_len"]
+    for (model, lang, doc, method), g in df.groupby(keys):
+        P = float(ctx.get((model, lang, doc), np.nan))
+        if not np.isfinite(P) or P <= 0:
+            continue
+        r_c = 1.0 - budget / P
+        if r_c <= 0:
+            out.append({"model": model, "lang": lang, "doc": doc, "method": method,
+                        "ctx_len": P, "budget_ratio": 0.0, "compressed_frac": 0.0,
+                        "delta_nll": 0.0, "measured": 0})
+            continue
+        g2 = g.dropna(subset=["ratio", "delta_nll"]).sort_values("ratio")
+        exact = g2[g2.get("ratio_kind", "") == "fixed_budget"] if "ratio_kind" in g2 else g2.iloc[0:0]
+        if len(exact):
+            v, measured = float(exact["delta_nll"].iloc[0]), 1
+        elif len(g2) and g2["ratio"].min() <= r_c <= g2["ratio"].max():
+            v, measured = float(np.interp(r_c, g2["ratio"], g2["delta_nll"])), 0
+        else:
+            continue
+        out.append({"model": model, "lang": lang, "doc": doc, "method": method,
+                    "ctx_len": P, "budget_ratio": r_c, "compressed_frac": r_c,
+                    "delta_nll": v, "measured": measured})
+    rows = pd.DataFrame(out)
+    if rows.empty:
+        return rows
+    agg = []
+    for (model, method, lang), g in rows.groupby(["model", "method", "lang"]):
+        x = g["delta_nll"].to_numpy()
+        lo, hi = boot_ci(x)
+        agg.append({"model": model, "method": method, "lang": lang,
+                    "ctx_len_mean": float(g["ctx_len"].mean()),
+                    "compressed_frac": float(g["compressed_frac"].mean()),
+                    "delta_nll_pct": 100 * np.expm1(np.nanmean(x)),
+                    "ci_lo_pct": 100 * np.expm1(lo), "ci_hi_pct": 100 * np.expm1(hi),
+                    "measured_frac": float(g["measured"].mean()),
+                    "n_docs": int(np.isfinite(x).sum())})
+    return pd.DataFrame(agg)
+
+
 def needle_table(df):
     if "exact" not in df.columns:
         return pd.DataFrame()
@@ -358,6 +410,41 @@ def fig_operator(em, outdir, model=None):
     return path
 
 
+def fig_fixed_budget(fbt, outdir, budget, model=None):
+    """The unfairness of a fixed token budget, drawn: the same method, the same C,
+    and English is not compressed at all while Tamil loses half its cache."""
+    plt = _plt()
+    if fbt.empty:
+        return None
+    if model is None:
+        model = sorted(fbt.model.unique())[0]
+    d = fbt[fbt.model == model]
+    order = (d.drop_duplicates("lang").sort_values("ctx_len_mean"))
+    langs = [l for l in order.lang]
+    methods = [m for m in ["evict_snapkv", "evict_vk", "evict_keynorm", "evict_window"]
+               if m in set(d.method)]
+    if not methods:
+        methods = sorted(d.method.unique())[:3]
+    x = np.arange(len(langs))
+    w = 0.8 / max(1, len(methods))
+    fig, ax = plt.subplots(figsize=(5.2, 3.4))
+    for k, m in enumerate(methods):
+        g = d[d.method == m].set_index("lang")
+        vals = [g.loc[l, "delta_nll_pct"] if l in g.index else np.nan for l in langs]
+        ax.bar(x + (k - (len(methods) - 1) / 2) * w, vals, w, label=m)
+    fracs = order.set_index("lang")["compressed_frac"]
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{l}\n{100*fracs[l]:.0f}% removed" for l in langs], fontsize=8)
+    ax.axhline(0, color="k", lw=0.8)
+    ax.set_ylabel("perplexity increase (%)")
+    ax.set_title(f"fixed budget C = {budget} tokens", fontsize=9)
+    ax.legend(fontsize=7, frameon=False, ncol=2)
+    fig.tight_layout()
+    path = os.path.join(outdir, f"fig6_fixed_budget.png")
+    fig.savefig(path); fig.savefig(path.replace(".png", ".pdf")); plt.close(fig)
+    return path
+
+
 def fig_recall(nt, outdir):
     plt = _plt()
     if nt.empty:
@@ -391,6 +478,9 @@ def main():
     ap.add_argument("--gen", nargs="*", default=[])
     ap.add_argument("--serve", nargs="*", default=[])
     ap.add_argument("--outdir", default="out")
+    ap.add_argument("--fixed-budget", type=int, default=1024,
+                    help="token budget for the fixed-budget comparison (PagedEviction uses "
+                         "256-4096; 1024 is their headline setting)")
     ap.add_argument("--no-figures", action="store_true")
     args = ap.parse_args()
 
@@ -428,6 +518,10 @@ def main():
     pt = paired_tests(em, "evict_snapkv", "merge_snapkv")
     pt.to_csv(os.path.join(tab, "paired_evict_vs_merge.csv"), index=False)
 
+    fb = fixed_budget_table(df, args.fixed_budget)
+    if not fb.empty:
+        fb.to_csv(os.path.join(tab, "fixed_budget.csv"), index=False)
+
     nt = pd.DataFrame()
     if args.needle:
         nd = load(args.needle, required=False)
@@ -460,6 +554,9 @@ def main():
     if not nt.empty:
         print("\n== needle recall (exact) ==")
         print(nt.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    if not fb.empty:
+        print(f"\n== fixed token budget C = {args.fixed_budget} (English needs no compression) ==")
+        print(fb.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
     if not gt.empty:
         print("\n== generation: fraction of uncompressed greedy prefix reproduced ==")
         print(gt.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
@@ -469,7 +566,8 @@ def main():
 
     if not args.no_figures:
         paths = [fig_fertility(exp, fig), fig_ppl_curve(df, fig),
-                 fig_equal_memory(em_tab, fig), fig_operator(em, fig)]
+                 fig_equal_memory(em_tab, fig), fig_operator(em, fig),
+                 fig_fixed_budget(fb, fig, args.fixed_budget)]
         if not nt.empty:
             paths.append(fig_recall(nt, fig))
         print("\nfigures:")
