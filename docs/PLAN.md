@@ -111,16 +111,25 @@ tensor-parallel scaling.
 | # | Experiment | Command | Answers | Cost (T4) |
 |---|---|---|---|---|
 | E1 | Fertility table, 6 langs, 2 tokenizers | `make_data.py --tokenizer ...` | RQ1: how big is the penalty, per tokenizer | minutes |
-| E2 | Quality sweep, Llama-1B FP32, 60 docs | `kv_compress.py --docs 60 --equal-memory` | RQ2/RQ3: quality at equal memory | ~2 h |
-| E3 | Quality sweep, Qwen-3B FP16, 60 docs | same, `--model Qwen/... --dtype float16` | RQ5: does it replicate across tokenizers | ~1 h |
-| E4 | Needle probe, 40 docs | `--needle --docs 40` | RQ2: long-range recall under compression | ~1 h |
-| E5 | Generation, 20 docs, 16 steps | `--gen-steps 16` | RQ4: trajectory stability | ~1.5 h |
-| E6 | Recency control | `--protect-last 32` | Confound: is merging failing only because it eats recent tokens | ~30 min |
+| E2 | Quality sweep, Llama-1B FP32, 60 docs | `kv_compress.py --docs 60 --equal-memory` | RQ2/RQ3: quality at equal memory | ~3 h |
+| E3 | Quality sweep, Qwen-3B FP16, 60 docs | same, `--model Qwen/... --dtype float16` | RQ5: does it replicate across tokenizers | ~1.5 h |
+| E4 | Needle probe, 40 docs | `--needle --docs 40` | RQ2: long-range recall under compression | ~1.5 h |
+| E5 | Generation, 20 docs, 16 steps | `--gen-steps 16` | RQ4: trajectory stability | ~2 h |
+| E6 | Recency control | `--protect-last 32` | Confound: is merging failing only because it eats recent tokens | ~45 min |
 | E7 | Serving sweep, vLLM, 6 langs | `serve_bench.py --mode offline` | RQ1: measured capacity, TTFT/TPOT, preemptions | ~1 h |
 | E8 | Bootstrap + regression + figures | `analyze.py` | All | minutes |
 
-Total ≈ 6 T4-hours. One Kaggle account (30 h/week) is enough; do not spread runs
-across accounts.
+Total ≈ 9–10 T4-hours. One Kaggle account (30 h/week) still covers it, but E2 no
+longer fits comfortably in a single 9-hour session: shard it (three 20-document
+runs) and use `--append`.
+
+**The cap is not a knob.** `--max-tokens` defaults to 4096 because a Tamil or
+Amharic document of ten FLORES sentences is ~2,100–2,600 tokens. A cap of 1024 —
+the old default — silently truncated only the high-fertility languages, which both
+deleted the effect being measured and biased $r_\ell$ *downwards* (a truncated Tamil
+document looks less fertile). Every row now carries `truncated` and `n_tokens_full`,
+and `analyze.py` prints a warning if any row hit the cap. If you see that warning,
+the run is invalid for that language.
 
 **E6 is not optional.** The current report already flags "recent-token protection
 confound" as a threat. It is one flag and it defends the central operator claim.

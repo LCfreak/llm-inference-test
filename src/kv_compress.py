@@ -532,10 +532,18 @@ def word_ids_from_offsets(text, offsets):
 
 
 def build_ids(tokenizer, text, max_tokens, device):
+    """Tokenize and (only if necessary) truncate.
+
+    Returns (ids, words, n_tokens_full). `max_tokens` is a SAFETY cap, never a
+    content control: truncating one language and not another would delete exactly
+    the fertility effect this study measures, and would bias its equal-memory ratio
+    downwards. Callers must record and report `n_tokens_full > max_tokens`.
+    """
     enc = tokenizer(text, return_tensors="pt", return_offsets_mapping=True)
+    full = int(enc["input_ids"].shape[1])
     ids = enc["input_ids"][:, :max_tokens].to(device)
     offsets = enc["offset_mapping"][0, :max_tokens].tolist()
-    return ids, word_ids_from_offsets(text, offsets)
+    return ids, word_ids_from_offsets(text, offsets), full
 
 
 def parse_layers(spec, n_layers):
@@ -635,7 +643,9 @@ def run_needle(args, model, tokenizer, device, layers_set, n_layers, tag):
             sents = chunk[lang].astype(str).tolist()
             k = max(1, int(args.needle_pos * len(sents)))
             text = " ".join(sents[:k] + [tmpl.format(c=code)] + sents[k:]) + " " + query
-            ids, words = build_ids(tokenizer, text, args.max_tokens + 64, device)
+            ids, words, full = build_ids(tokenizer, text, args.max_tokens + 64, device)
+            if full > ids.shape[1]:
+                print(f"[warn] needle doc {d} {lang}: truncated {full} -> {ids.shape[1]} tokens", flush=True)
             ans = tokenizer(" " + code, add_special_tokens=False,
                             return_tensors="pt")["input_ids"].to(device)
             ctx_ids, last_q = ids[:, :-1], ids[:, -1:]
@@ -720,12 +730,15 @@ def run(args):
         prepared = {}
         for lang in args.langs:
             text = " ".join(chunk[lang].astype(str))
-            ids, words = build_ids(tokenizer, text, args.max_tokens, device)
-            prepared[lang] = (ids, words, int(ids.shape[1] * args.ctx_frac))
+            ids, words, full = build_ids(tokenizer, text, args.max_tokens, device)
+            if full > ids.shape[1]:
+                print(f"[warn] doc {d} {lang}: TRUNCATED {full} -> {ids.shape[1]} tokens; "
+                      f"raise --max-tokens (equal-memory ratio is biased)", flush=True)
+            prepared[lang] = (ids, words, int(ids.shape[1] * args.ctx_frac), full)
         ref = prepared["english"][2] if "english" in prepared else min(v[2] for v in prepared.values())
 
         for lang in args.langs:
-            ids, words, ctx_len = prepared[lang]
+            ids, words, ctx_len, full = prepared[lang]
             N = ids.shape[1]
             if ctx_len < 8 or N - ctx_len < 3:
                 print(f"[warn] doc {d} {lang}: context too short ({N} tokens), skipped", flush=True)
@@ -765,6 +778,7 @@ def run(args):
                         "nll_base": nll_base, "nll": nll, "delta_nll": nll - nll_base,
                         "kl": kl, "top1_agree": top1, "gen_prefix_frac": gen_frac,
                         "protect_last": args.protect_last,
+                        "n_tokens_full": full, "truncated": int(full > N),
                     })
         _flush(rows, args, COMPRESS_KEY)
         print(f"doc {d} done ({time.time() - t0:.0f}s, {len(rows)} rows)", flush=True)
@@ -780,7 +794,9 @@ if __name__ == "__main__":
     ap.add_argument("--docs", type=int, default=8, help="number of multi-sentence documents")
     ap.add_argument("--doc-start", type=int, default=0, help="first document index (sharding)")
     ap.add_argument("--sents", type=int, default=10, help="FLORES sentences per document")
-    ap.add_argument("--max-tokens", type=int, default=1024)
+    ap.add_argument("--max-tokens", type=int, default=4096,
+                    help="SAFETY cap only; must exceed the most fertile language's full "
+                         "length or truncation biases the equal-memory ratio")
     ap.add_argument("--ctx-frac", type=float, default=0.75, help="fraction used as cached context")
     ap.add_argument("--ratios", type=float, nargs="+", default=[0.3, 0.6, 0.8])
     ap.add_argument("--equal-memory", action="store_true",

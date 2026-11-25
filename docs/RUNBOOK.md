@@ -100,7 +100,7 @@ python src/kv_compress.py \
   --device cuda --dtype float32 \
   --model meta-llama/Llama-3.2-1B-Instruct \
   --langs english nepali hindi bengali tamil amharic \
-  --docs 60 --sents 10 --max-tokens 1024 \
+  --docs 60 --sents 10 --max-tokens 4096 \
   --ratios 0.3 0.6 0.8 --equal-memory \
   --out out/compress_llama1b.csv
 ```
@@ -112,6 +112,7 @@ What the flags do:
 | `--equal-memory` | adds each language's exact $r_\ell = 1 - P_{en}/P_\ell$ to the sweep, so no interpolation is needed for the headline number |
 | `--doc-start` | first document index; used for sharding across sessions |
 | `--append` | merge into an existing CSV and de-duplicate, so a killed run resumes |
+| `--max-tokens 4096` | safety cap only. It must exceed the longest Tamil/Amharic document; a binding cap truncates only the high-fertility languages and biases $r_\ell$ downwards. Every row records `truncated` and `n_tokens_full`. |
 | `--protect-last 32` | recency control (PLAN E6) |
 | `--dtype float16` | only for Qwen-3B on T4; keep Llama-1B in FP32 |
 | `--tag` | overrides the model tag written to every row |
@@ -262,6 +263,7 @@ quota. Pooling quota across accounts risks the accounts and saves nothing.
 | vLLM: no supported attention backend | T4 is sm_75 | `VLLM_ATTENTION_BACKEND=XFORMERS`, else `--mode hf` |
 | Kaggle run killed at 9 h | session cap | smaller `--docs`, `--append`, resume |
 | `--append` duplicates rows | key columns changed between runs | keep `--tag`, `--sents`, `--protect-last` identical |
+| `[warn] TRUNCATED` | `--max-tokens` below the Tamil/Amharic document length | raise it to 4096+; the run is invalid for that language otherwise |
 | Selftest diff ≫ 1e-3 | transformers version drift | pin `transformers==5.22.1` |
 
 ---
@@ -271,11 +273,15 @@ quota. Pooling quota across accounts risks the accounts and saves nothing.
 | Step | Estimate |
 |---|---|
 | `make_data.py` (6 langs, 2 tokenizers) | 5 min |
-| E2 sweep, 60 docs, Llama-1B FP32 | ~2 h |
-| E3 sweep, 60 docs, Qwen-3B FP16 | ~1 h |
-| E4 needle, 40 docs | ~1 h |
-| E5 generation, 20 docs | ~1.5 h |
-| E6 recency control | ~30 min |
+| E2 sweep, 60 docs, Llama-1B FP32 | ~3 h |
+| E3 sweep, 60 docs, Qwen-3B FP16 | ~1.5 h |
+| E4 needle, 40 docs | ~1.5 h |
+| E5 generation, 20 docs | ~2 h |
+| E6 recency control | ~45 min |
 | E7 serving | ~1 h |
 | Analysis + figures | 5 min |
-| **Total** | **~7 h** |
+| **Total** | **~9–10 h** |
+
+Estimates assume 10-sentence documents at `--max-tokens 4096`, i.e. contexts of
+~220 (EN) to ~2,100 (TA/AM) tokens. Shard E2 into three 20-document runs so no
+single session approaches the 9-hour cap.

@@ -408,6 +408,13 @@ def main():
     df = load(args.inputs)
     print(f"loaded {len(df)} rows from {df.model.nunique()} model(s): {sorted(df.model.unique())}")
 
+    if "truncated" in df.columns:
+        bad = df[df["truncated"].fillna(0) > 0]
+        if len(bad):
+            print(f"[warn] {len(bad)} rows hit the --max-tokens cap "
+                  f"({bad.groupby('lang').size().to_dict()}); those equal-memory ratios are "
+                  f"biased low. Re-run with a larger cap.")
+
     exp = expansion_table(df)
     exp.to_csv(os.path.join(tab, "expansion.csv"), index=False)
 
