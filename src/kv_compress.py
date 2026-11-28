@@ -141,6 +141,10 @@ def attend(model, q, k, v, add_mask):
     rep = nH // nKV
     kk = k.repeat_interleave(rep, dim=1)
     vv = v.repeat_interleave(rep, dim=1)
+    # Guard: a cache tensor can arrive in a different dtype than q (e.g. fp32 stats
+    # against an fp16 model). matmul requires both operands to match.
+    kk = kk.to(q.dtype)
+    vv = vv.to(q.dtype)
     scores = q @ kk.transpose(-1, -2) / math.sqrt(hd) + add_mask
     # Softmax in float32: keeps fp16 runs on T4 numerically stable and leaves fp32 unchanged.
     w = scores.float().softmax(dim=-1)
@@ -515,8 +519,11 @@ def apply_groups(K, V, groups, use_bias=True):
     m = (e - s).float()
 
     def mean(X):
-        cs = F.pad(X.cumsum(dim=2), (0, 0, 1, 0))        # (1,nKV,P+1,hd)
-        return (cs[:, :, e] - cs[:, :, s]) / m[None, None, :, None]
+        # Accumulate in fp32 (a 2000-entry fp16 cumsum loses precision) but return
+        # the cache in the model's own dtype: a float32 result would make the
+        # downstream q @ k matmul fail on fp16/bfloat16 models.
+        cs = F.pad(X.float().cumsum(dim=2), (0, 0, 1, 0))  # (1,nKV,P+1,hd)
+        return ((cs[:, :, e] - cs[:, :, s]) / m[None, None, :, None]).to(X.dtype)
 
     bias = torch.log(m) if use_bias else torch.zeros_like(m)
     return mean(K), mean(V), bias
